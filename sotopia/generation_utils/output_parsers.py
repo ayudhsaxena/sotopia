@@ -30,12 +30,38 @@ class PydanticOutputParser(OutputParser[T], Generic[T]):
     def parse(self, result: str) -> T:
         json_result = json_repair.loads(result)
         assert isinstance(json_result, dict)
-        if "properties" in json_result:
-            return self.pydantic_object.model_validate_json(
-                json.dumps(json_result["properties"])
-            )
+        
+        # Check if the model output the schema instead of actual data
+        # This happens when the model gets confused and outputs the JSON schema
+        if "properties" in json_result and "required" in json_result and "title" in json_result:
+            # This looks like a JSON schema, not actual data
+            # Try to extract the actual data from the properties if possible
+            if "properties" in json_result:
+                # Check if properties contains actual data or schema definitions
+                properties = json_result["properties"]
+                actual_data = {}
+                for key, value in properties.items():
+                    if isinstance(value, dict):
+                        if "type" in value and "description" in value:
+                            # This is a schema definition, not actual data
+                            # We can't recover from this, so we'll need to retry
+                            raise ValueError(f"Model output JSON schema instead of actual data. Got schema for field '{key}': {value}")
+                        else:
+                            # This might be actual data
+                            actual_data[key] = value
+                    else:
+                        # This is actual data
+                        actual_data[key] = value
+                
+                if actual_data:
+                    return self.pydantic_object.model_validate(actual_data)
+                else:
+                    raise ValueError("Model output JSON schema instead of actual data")
+            else:
+                raise ValueError("Model output JSON schema instead of actual data")
         else:
-            parsed_result = self.pydantic_object.model_validate_json(result)
+            # This looks like actual data
+            parsed_result = self.pydantic_object.model_validate(json_result)
             return parsed_result
 
     def get_format_instructions(self) -> str:

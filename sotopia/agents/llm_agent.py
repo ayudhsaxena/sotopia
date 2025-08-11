@@ -11,6 +11,10 @@ from sotopia.generation_utils.generate import (
 )
 from sotopia.messages import AgentAction, Observation
 from sotopia.messages.message_classes import ScriptBackground
+from sotopia.utils import format_docstring
+
+from sotopia.generation_utils.output_parsers import  PydanticOutputParser
+
 
 
 async def ainput(prompt: str = "") -> str:
@@ -48,13 +52,16 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
     def goal(self, goal: str) -> None:
         self._goal = goal
 
+    def update_inbox(self, obs: Observation) -> None:
+        self.recv_message("Environment", obs)
+
     def act(
         self,
         _obs: Observation,
     ) -> AgentAction:
         raise Exception("Sync act method is deprecated. Use aact instead.")
 
-    async def aact(self, obs: Observation) -> AgentAction:
+    async def aact(self, obs: Observation, use_prediction: bool = False) -> AgentAction | tuple[AgentAction, str]:
         self.recv_message("Environment", obs)
 
         if self._goal is None:
@@ -66,30 +73,120 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
             )
 
         if len(obs.available_actions) == 1 and "none" in obs.available_actions:
-            return AgentAction(action_type="none", argument="")
+            return AgentAction(action_type="none", argument=""), ""
         else:
-            action = await agenerate_action(
-                self.model_name,
-                history="\n".join(f"{y.to_natural_language()}" for x, y in self.inbox),
-                turn_number=obs.turn_number,
-                action_types=obs.available_actions,
-                agent=self.agent_name,
-                goal=self.goal,
-                script_like=self.script_like,
-            )
-            # Temporary fix for mixtral-moe model for incorrect generation format
-            if "Mixtral-8x7B-Instruct-v0.1" in self.model_name:
-                current_agent = self.agent_name
-                if f"{current_agent}:" in action.argument:
-                    print("Fixing Mixtral's generation format")
-                    action.argument = action.argument.replace(f"{current_agent}: ", "")
-                elif f"{current_agent} said:" in action.argument:
-                    print("Fixing Mixtral's generation format")
-                    action.argument = action.argument.replace(
-                        f"{current_agent} said: ", ""
-                    )
+            if use_prediction:
+                return await agenerate_action(
+                    self.model_name,
+                    history="\n".join(f"{y.to_natural_language()}" for x, y in self.inbox),
+                    turn_number=obs.turn_number,
+                    action_types=obs.available_actions,
+                    agent=self.agent_name,
+                    goal=self.goal,
+                    script_like=self.script_like,
+                    use_prediction=use_prediction,
+                )
+            else:
+                action = await agenerate_action(
+                    self.model_name,
+                    history="\n".join(f"{y.to_natural_language()}" for x, y in self.inbox),
+                    turn_number=obs.turn_number,
+                    action_types=obs.available_actions,
+                    agent=self.agent_name,
+                    goal=self.goal,
+                    script_like=self.script_like,
+                    use_prediction=use_prediction,
+                )
+                # Temporary fix for mixtral-moe model for incorrect generation format
+                if "Mixtral-8x7B-Instruct-v0.1" in self.model_name:
+                    current_agent = self.agent_name
+                    if f"{current_agent}:" in action.argument:
+                        print("Fixing Mixtral's generation format")
+                        action.argument = action.argument.replace(f"{current_agent}: ", "")
+                    elif f"{current_agent} said:" in action.argument:
+                        print("Fixing Mixtral's generation format")
+                        action.argument = action.argument.replace(
+                            f"{current_agent} said: ", ""
+                        )
 
-            return action
+                return action
+
+    # ------------------------------------------------------------------
+    # Prompt-construction helper
+    # ------------------------------------------------------------------
+
+    def build_action_prompt(
+        self,
+        obs: Observation,
+        use_prediction: bool = False,
+    ) -> str:
+        """Return the fully formatted template used for action generation.
+
+        Parameters
+        ----------
+        obs : Observation
+            The current observation provided by the environment.
+        """
+
+
+        history = "\n".join(
+            f"{y.to_natural_language()}" for _, y in self.inbox
+        )
+        if use_prediction:
+            template = """
+                Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
+                You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
+                Note that {agent}'s goal is only visible to you.
+                You should try your best to achieve {agent}'s goal in a way that align with their character traits.
+                Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
+                {history}.
+                You are at Turn #{turn_number}. Your available action types are
+                {action_list}.
+                Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
+
+                Your action (within the <response></response> tags) should follow the given format:
+                {format_instructions}
+
+                IMPORTANT: The output inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema. 
+                For example, output: 
+                <prediction>I think the other participant is thinking that I'm being too formal and they want to have a more casual conversation.</prediction>
+                <think>Based on this prediction, I should be more relaxed and friendly in my response to match their conversational style.</think>
+                <response>{{"action_type": "speak", "argument": "Hey, how's it going? Nice to meet you!"}}</response>
+            """
+        else:
+            template = """
+                Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
+                You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
+                Note that {agent}'s goal is only visible to you.
+                You should try your best to achieve {agent}'s goal in a way that align with their character traits.
+                Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
+                {history}.
+                You are at Turn #{turn_number}. Your available action types are
+                {action_list}.
+                Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
+
+                Your action (within the <response></response> tags) should follow the given format:
+                {format_instructions}
+
+                IMPORTANT: The output inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema. 
+                For example, output: 
+                <think>Doing some thinking here</think>
+                <response>{{"action_type": "speak", "argument": "Hello, how are you?"}}</response>
+            """
+        # Template identical to that in `agenerate_action`
+       
+
+        output_parser = PydanticOutputParser(pydantic_object=AgentAction)
+
+        filled_prompt = template.format(
+            agent=self.agent_name,
+            turn_number=str(obs.turn_number),
+            history=history,
+            action_list=" ".join(obs.available_actions),
+            format_instructions=output_parser.get_format_instructions(),
+        )
+
+        return format_docstring(filled_prompt)
 
 
 class ScriptWritingAgent(LLMAgent):

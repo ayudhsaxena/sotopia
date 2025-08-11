@@ -19,6 +19,7 @@ from sotopia.messages.message_classes import (
     ScriptInteraction,
     ScriptInteractionReturnType,
 )
+from sotopia.generation_utils.xml_parser import XMLParser
 from sotopia.utils import format_docstring
 
 
@@ -51,6 +52,18 @@ log.addHandler(console_handler)
 # subject to future OpenAI changes
 DEFAULT_BAD_OUTPUT_PROCESS_MODEL = "gpt-4o-mini"
 
+
+SOTOPIA_PROMPT = """
+You are a participant in a social interaction scenario. Your goal is to engage in natural, meaningful conversation while working towards your assigned objective. Before you respond, think carefully within the <think></think> tags about what's the best way to respond to the other participant.
+Respond in the following format:
+<think>...</think>
+<response>...</response>
+
+The content inside the <response></response> tags should be a valid JSON object with the actual values following the JSON schema provided and NOT the JSON schema itself. 
+For example:
+<think>Doing some thinking here</think>
+<response>{{"action_type": "speak", "argument": "Hello, how are you?"}}</response>
+"""
 
 @validate_call
 async def format_bad_output(
@@ -95,12 +108,15 @@ async def agenerate(
     structured_output: bool = False,
     bad_output_process_model: str | None = None,
     use_fixed_model_version: bool = True,
-) -> OutputType:
+    use_prediction: bool = False,   
+) -> OutputType | tuple[AgentAction | OutputType, str]:
+
     """Generate text using LiteLLM instead of Langchain."""
+    response_parser = XMLParser(fields=["think", "response"], answer_field="response")
     # Format template with input values
     if "format_instructions" not in input_values:
         input_values["format_instructions"] = output_parser.get_format_instructions()
-
+    
     # Process template
     template = format_docstring(template)
 
@@ -144,11 +160,16 @@ async def agenerate(
         )
         result = response.choices[0].message.content
         log.info(f"Generated result: {result}")
+
         assert isinstance(result, str)
         return cast(OutputType, output_parser.parse(result))
-
-    messages = [{"role": "user", "content": template}]
-
+    if use_prediction:
+        messages = [
+            {"role": "system", "content": SOTOPIA_PROMPT},
+            {"role": "user", "content": template},
+        ]
+    else:   
+        messages = [{"role": "user", "content": template}]
     response = await acompletion(
         model=model_name,
         messages=messages,
@@ -159,8 +180,64 @@ async def agenerate(
     )
     result = response.choices[0].message.content
 
+    if use_prediction:
+        return perform_output_parsing(response, output_parser, response_parser)
+    else:
+        try:
+            parsed_result = output_parser.parse(result)
+        except Exception as e:
+            if isinstance(output_parser, ScriptOutputParser):
+                raise e
+            log.debug(
+                f"[red] Failed to parse result: {result}\nEncounter Exception {e}\nstart to reparse",
+                extra={"markup": True},
+            )
+            # Handle bad output reformatting
+            reformat_result = await format_bad_output(
+                result,
+                output_parser.get_format_instructions(),
+                bad_output_process_model or model_name,
+                use_fixed_model_version,
+            )
+            parsed_result = output_parser.parse(reformat_result)
+
+    log.info(f"Generated result: {parsed_result}")
+    return parsed_result
+
+def perform_output_parsing(response, output_parser, response_parser) -> tuple[AgentAction | OutputType, str]:
+    result = response.choices[0].message.content
+
+    # Check if the response has reasoning_content (API-parsed thinking)
+    think = None
+    if hasattr(response.choices[0].message, 'reasoning_content') :
+        think = response.choices[0].message.reasoning_content
+
+    # If no reasoning_content, try to parse from result
+    if think is None:
+        parsed_response = response_parser.parse(result)
+        if hasattr(parsed_response, 'think'):
+            think = getattr(parsed_response, 'think')
+            if think is None:
+                split_response = result.split(f"<response>")
+                if len(split_response) > 1:
+                    think = split_response[0]
+                else:
+                    think = result
+    
+    # Parse the response part
+    parsed_response = response_parser.parse(result)
+    if hasattr(parsed_response,'response'):
+        action = getattr(parsed_response, 'response')
+        if action is None:
+            split_response = result.split(f"<response>")
+            if len(split_response) > 1:
+                action = split_response[-1]
+            else:
+                action = result
+    
     try:
-        parsed_result = output_parser.parse(result)
+        parsed_result = output_parser.parse(action)
+        return parsed_result, think
     except Exception as e:
         if isinstance(output_parser, ScriptOutputParser):
             raise e
@@ -168,18 +245,8 @@ async def agenerate(
             f"[red] Failed to parse result: {result}\nEncounter Exception {e}\nstart to reparse",
             extra={"markup": True},
         )
-        # Handle bad output reformatting
-        reformat_result = await format_bad_output(
-            result,
-            output_parser.get_format_instructions(),
-            bad_output_process_model or model_name,
-            use_fixed_model_version,
-        )
-        parsed_result = output_parser.parse(reformat_result)
-
-    log.info(f"Generated result: {parsed_result}")
-    return parsed_result
-
+        agent_action = AgentAction(action_type="speak", argument=action)
+        return agent_action, think
 
 @gin.configurable
 @validate_call
@@ -250,11 +317,12 @@ async def agenerate_action(
     action_types: list[ActionType],
     agent: str,
     goal: str,
+    use_prediction: bool = False,
     temperature: float = 0.7,
     script_like: bool = False,
     bad_output_process_model: str | None = None,
     use_fixed_model_version: bool = True,
-) -> AgentAction:
+) -> AgentAction | tuple[AgentAction, str]:
     """
     Using langchain to generate an example episode
     """
@@ -271,27 +339,52 @@ async def agenerate_action(
                 {action_list}.
                 Note: The script can be ended if 1. one agent have achieved social goals, 2. this conversation makes the agent uncomfortable, 3. the agent find it uninteresting/you lose your patience, 4. or for other reasons you think it should stop.
 
-                Please only generate a JSON string including the action type and the argument.
                 Your action should follow the given format:
                 {format_instructions}
+
+                IMPORTANT: You must output ONLY a valid JSON object with the actual values, NOT the JSON schema. 
+                For example, output: {{"action_type": "speak", "argument": "Hello, how are you?"}}
             """
         else:
             # Normal case, model as agent
-            template = """
-                Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
-                You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
-                Note that {agent}'s goal is only visible to you.
-                You should try your best to achieve {agent}'s goal in a way that align with their character traits.
-                Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
-                {history}.
-                You are at Turn #{turn_number}. Your available action types are
-                {action_list}.
-                Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
+            if use_prediction:
+                template = """
+                    Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
+                    You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
+                    Note that {agent}'s goal is only visible to you.
+                    You should try your best to achieve {agent}'s goal in a way that align with their character traits. 
+                    Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
+                    {history}.
+                    You are at Turn #{turn_number}. Your available action types are
+                    {action_list}.
+                    Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
 
-                Please only generate a JSON string including the action type and the argument.
-                Your action should follow the given format:
-                {format_instructions}
-            """
+                    Your action (within the <response></response> tags) should follow the given format:
+                    {format_instructions}
+
+                    IMPORTANT: The output inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema. 
+                    For example, output: 
+                    <think>Doing some thinking here</think>
+                    <response>{{"action_type": "speak", "argument": "Hello, how are you?"}}</response>
+                    """
+            else:
+                template = """
+                    Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
+                    You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
+                    Note that {agent}'s goal is only visible to you.
+                    You should try your best to achieve {agent}'s goal in a way that align with their character traits.
+                    Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
+                    {history}.
+                    You are at Turn #{turn_number}. Your available action types are
+                    {action_list}.
+                    Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
+
+                    Your action should follow the given format:
+                    {format_instructions}
+
+                    IMPORTANT: You must output ONLY a valid JSON object with the actual values, NOT the JSON schema. 
+                    For example, output: {{"action_type": "speak", "argument": "Hello, how are you?"}}
+                """
         return await agenerate(
             model_name=model_name,
             template=template,
@@ -305,9 +398,13 @@ async def agenerate_action(
             temperature=temperature,
             bad_output_process_model=bad_output_process_model,
             use_fixed_model_version=use_fixed_model_version,
+            use_prediction=use_prediction,
         )
     except Exception as e:
-        log.warning(f"Failed to generate action due to {e}")
+        if "Model output JSON schema instead of actual data" in str(e):
+            log.warning(f"Model {model_name} output JSON schema instead of actual data. This usually happens when the model gets confused about the output format. Error: {e}")
+        else:
+            log.warning(f"Failed to generate action due to {e}")
         return AgentAction(action_type="none", argument="")
 
 

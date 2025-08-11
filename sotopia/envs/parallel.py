@@ -206,12 +206,12 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
             or "partial_background_file" not in options
             and "full_background_file" not in options
         ), "partial_background_file and full_background_file are not supported anymore"
-        if agents is not None:
+        if agents is not None:  
             assert agents, "agents must be provided"
-            assert len(agents) == 2, "Only supporting two agents right now"
+            assert len(agents) == 2, f"Only supporting two agents right now, got {len(agents)}"
             agent_names = list(agents.keys())
             agent_goals = self.profile.agent_goals
-            assert len(agent_goals) == 2, "Only supporting two agents right now"
+            assert len(agent_goals) == 2, f"Only supporting two agents right now, got {len(agent_goals)}"
 
             raw_background = self.background_class(
                 scenario=self.profile.scenario,
@@ -296,6 +296,7 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
 
         self.recv_message("Environment", self.background)
 
+
         return {
             self.background.p1_name: Observation(
                 last_turn=background_for_a.to_natural_language(),
@@ -359,6 +360,25 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
                 )
             )
         )
+
+        if response.terminated:
+            terminal_response = unweighted_aggregate_evaluate(
+                list(
+                    itertools.chain(
+                        *(
+                            evaluator(turn_number=self.turn_number, messages=self.inbox)
+                            for evaluator in self.terminal_evaluators
+                        )
+                    )
+                )
+            )
+            # incorporate terminal response into response
+            response.p1_rate = response.p1_rate or terminal_response.p1_rate
+            response.p2_rate = response.p2_rate or terminal_response.p2_rate
+            if response.comments and terminal_response.comments:
+                response.comments += terminal_response.comments
+            elif terminal_response.comments:
+                response.comments = terminal_response.comments
 
         self.action_mask = [False for _ in self.agents]
         if self.action_order == "round-robin":
@@ -440,6 +460,7 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
             if isinstance(action, AgentAction):
                 complied_actions[key] = action
             else:
+                print(f"Received non-AgentAction: {action}")
                 action["action_type"] = self.available_action_types[
                     int(action["action_type"])
                 ]
@@ -471,7 +492,6 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
                 )
             )
         )
-
         if response.terminated:
             terminal_response = unweighted_aggregate_evaluate(
                 list(
