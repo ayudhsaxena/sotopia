@@ -30,6 +30,8 @@ class BaseEpisodeLog(BaseModel):
     reasoning: str = Field(default="")
     rewards: list[tuple[float, dict[str, float]] | float]  # Rewards arranged by turn
     rewards_prompt: str = Field(default="")
+    raw_messages: list[str] = Field(default=[])
+    agent_observation_history: list[str] = Field(default=[])
 
     @model_validator(mode="after")
     def agent_number_message_number_reward_number_turn_number_match(self) -> Self:

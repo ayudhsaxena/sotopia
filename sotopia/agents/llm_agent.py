@@ -14,8 +14,7 @@ from sotopia.messages.message_classes import ScriptBackground
 from sotopia.utils import format_docstring
 
 from sotopia.generation_utils.output_parsers import  PydanticOutputParser
-
-
+from sotopia.generation_utils.enums import MentalStateGeneration
 
 async def ainput(prompt: str = "") -> str:
     with ThreadPoolExecutor(1, "ainput") as executor:
@@ -32,6 +31,8 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
         agent_profile: AgentProfile | None = None,
         model_name: str = "gpt-4o-mini",
         script_like: bool = False,
+        mental_state_generation: MentalStateGeneration = MentalStateGeneration.NO_MENTAL_STATE,
+        mental_state_window: int | None = 2,
     ) -> None:
         super().__init__(
             agent_name=agent_name,
@@ -40,6 +41,8 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
         )
         self.model_name = model_name
         self.script_like = script_like
+        self.mental_state_generation: MentalStateGeneration = mental_state_generation
+        self.mental_state_window: int | None = mental_state_window
 
     @property
     def goal(self) -> str:
@@ -61,9 +64,8 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
     ) -> AgentAction:
         raise Exception("Sync act method is deprecated. Use aact instead.")
 
-    async def aact(self, obs: Observation, use_prediction: bool = False) -> AgentAction | tuple[AgentAction, str]:
+    async def aact(self, obs: Observation) -> AgentAction | tuple[AgentAction, str]:
         self.recv_message("Environment", obs)
-
         if self._goal is None:
             self._goal = await agenerate_goal(
                 self.model_name,
@@ -73,44 +75,55 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
             )
 
         if len(obs.available_actions) == 1 and "none" in obs.available_actions:
-            return AgentAction(action_type="none", argument=""), ""
+            return AgentAction(action_type="none", argument=""), ''
         else:
-            if use_prediction:
-                return await agenerate_action(
-                    self.model_name,
-                    history="\n".join(f"{y.to_natural_language()}" for x, y in self.inbox),
-                    turn_number=obs.turn_number,
-                    action_types=obs.available_actions,
-                    agent=self.agent_name,
-                    goal=self.goal,
-                    script_like=self.script_like,
-                    use_prediction=use_prediction,
-                )
+            # print(f"{self.agent_name}: {self.get_interaction_history(obs.turn_number)}")
+            return await agenerate_action(
+                self.model_name,
+                history=self.get_interaction_history(obs.turn_number),
+                turn_number=obs.turn_number,
+                action_types=obs.available_actions,
+                agent=self.agent_name,
+                goal=self.goal,
+                script_like=self.script_like,
+                mental_state_generation=self.mental_state_generation,
+            )
+
+    def get_interaction_history(self, turn_number: int) -> str:
+        history = []
+        for x, y in self.inbox:
+            if self.mental_state_generation == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE_WITH_GROUND_TRUTH:
+                base_use_mental_state = True
             else:
-                action = await agenerate_action(
-                    self.model_name,
-                    history="\n".join(f"{y.to_natural_language()}" for x, y in self.inbox),
-                    turn_number=obs.turn_number,
-                    action_types=obs.available_actions,
-                    agent=self.agent_name,
-                    goal=self.goal,
-                    script_like=self.script_like,
-                    use_prediction=use_prediction,
-                )
-                # Temporary fix for mixtral-moe model for incorrect generation format
-                if "Mixtral-8x7B-Instruct-v0.1" in self.model_name:
-                    current_agent = self.agent_name
-                    if f"{current_agent}:" in action.argument:
-                        print("Fixing Mixtral's generation format")
-                        action.argument = action.argument.replace(f"{current_agent}: ", "")
-                    elif f"{current_agent} said:" in action.argument:
-                        print("Fixing Mixtral's generation format")
-                        action.argument = action.argument.replace(
-                            f"{current_agent} said: ", ""
-                        )
+                base_use_mental_state = (turn_number-1)%2 == y.turn_number%2 # the previous turn (turn_number-1) is the same agent hence we can use the mental state of the current turn (obs.turn_number)
 
-                return action
+            if self.mental_state_window is not None:
+                within_window = y.turn_number > (turn_number - self.mental_state_window)
+            else:
+                within_window = True
 
+            use_mental_state = base_use_mental_state and within_window
+
+            history.append(f"{y.to_natural_language(use_mental_state=use_mental_state)}")
+        return "\n".join(history)
+    
+    def get_interaction_history_for_a_mental_state_window(self, turn_number: int, mental_state_window: int | None) -> str:
+        history = []
+        for x, y in self.inbox:
+            if self.mental_state_generation == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE_WITH_GROUND_TRUTH:
+                base_use_mental_state = True
+            else:
+                base_use_mental_state = (turn_number-1)%2 == y.turn_number%2 # the previous turn (turn_number-1) is the same agent hence we can use the mental state of the current turn (obs.turn_number)
+
+            if mental_state_window is not None:
+                within_window = y.turn_number > (turn_number - mental_state_window)
+            else:
+                within_window = True
+
+            use_mental_state = base_use_mental_state and within_window
+
+            history.append(f"{y.to_natural_language(use_mental_state=use_mental_state)}")
+        return "\n".join(history)
     # ------------------------------------------------------------------
     # Prompt-construction helper
     # ------------------------------------------------------------------
@@ -134,11 +147,12 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
         )
         if use_prediction:
             template = """
-                Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
-                You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
-                Note that {agent}'s goal is only visible to you.
-                You should try your best to achieve {agent}'s goal in a way that align with their character traits.
-                Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
+                You are {agent}. Think and speak as yourself.
+                Always use first-person pronouns (I, me, my, mine). Never refer to yourself in the third person or by your full name.
+                You can find your goal (or background) in the 'Here is the context of the interaction' field.
+                Note that your goal is only visible to you.
+                You should try your best to achieve your goal in a way that aligns with your character traits.
+                Additionally, maintain the conversation's naturalness and realism (e.g., do not repeat what the other person has already said).
                 {history}.
                 You are at Turn #{turn_number}. Your available action types are
                 {action_list}.
@@ -147,7 +161,9 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
                 Your action (within the <response></response> tags) should follow the given format:
                 {format_instructions}
 
-                IMPORTANT: The output inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema. 
+                IMPORTANT:
+                - Write your content inside <prediction>, <think>, and <response> from your own perspective using first person.
+                - The content inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema. 
                 For example, output: 
                 <prediction>I think the other participant is thinking that I'm being too formal and they want to have a more casual conversation.</prediction>
                 <think>Based on this prediction, I should be more relaxed and friendly in my response to match their conversational style.</think>
@@ -155,11 +171,12 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
             """
         else:
             template = """
-                Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
-                You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
-                Note that {agent}'s goal is only visible to you.
-                You should try your best to achieve {agent}'s goal in a way that align with their character traits.
-                Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
+                You are {agent}. Think and speak as yourself.
+                Always use first-person pronouns (I, me, my, mine). Never refer to yourself in the third person or by your full name.
+                You can find your goal (or background) in the 'Here is the context of the interaction' field.
+                Note that your goal is only visible to you.
+                You should try your best to achieve your goal in a way that aligns with your character traits.
+                Additionally, maintain the conversation's naturalness and realism (e.g., do not repeat what the other person has already said).
                 {history}.
                 You are at Turn #{turn_number}. Your available action types are
                 {action_list}.
@@ -168,7 +185,9 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
                 Your action (within the <response></response> tags) should follow the given format:
                 {format_instructions}
 
-                IMPORTANT: The output inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema. 
+                IMPORTANT:
+                - Write your content inside <think> (if any) and <response> from your own perspective using first person.
+                - The content inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema. 
                 For example, output: 
                 <think>Doing some thinking here</think>
                 <response>{{"action_type": "speak", "argument": "Hello, how are you?"}}</response>

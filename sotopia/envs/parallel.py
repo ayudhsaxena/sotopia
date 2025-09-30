@@ -11,7 +11,8 @@ from gymnasium.spaces.text import Text
 from pettingzoo.utils.env import ParallelEnv
 from pydantic import validate_call
 from redis_om.model.model import NotFoundError
-
+from sotopia.generation_utils.xml_parser import XMLParser
+from sotopia.generation_utils.output_parsers import PydanticOutputParser
 from sotopia.agents.llm_agent import Agents
 from sotopia.database import EnvironmentProfile
 from sotopia.database.persistent_profile import (
@@ -27,6 +28,7 @@ from sotopia.messages import (
     SimpleMessage,
 )
 from sotopia.renderers import RenderContext, XMLRenderer
+from sotopia.generation_utils.enums import MentalStateGeneration
 
 from .evaluators import Evaluator, unweighted_aggregate_evaluate
 
@@ -41,6 +43,114 @@ def _actions_to_natural_language(actions: dict[str, AgentAction]) -> str:
             if action_str != "":
                 action_str += ";"  # separate actions with semicolon
             action_str += f"{agent} {action.to_natural_language()}"
+    return action_str
+
+def _actions_to_natural_language_for_viewer(actions: dict[str, AgentAction], viewer: str) -> str:
+    action_str = ""
+    for agent, action in actions.items():
+        # Only record actions that did something
+        if action.action_type != "none":
+            if action_str != "":
+                action_str += ";"  # separate actions with semicolon
+            subject = "You" if agent == viewer else agent
+            action_str += f"{subject} {action.to_natural_language()}"
+    return action_str
+
+def _actions_to_natural_language_with_mental_state(actions: dict[str, str], agent_mental_state_generation: dict[str, MentalStateGeneration]) -> str:
+    action_str = ""
+    action_parser = PydanticOutputParser(pydantic_object=AgentAction)
+    for agent, action in actions.items():
+        if action.strip() != "":
+            if action_str != "":
+                action_str += ";"  # separate actions with semicolon
+            if agent_mental_state_generation[agent] == MentalStateGeneration.NO_MENTAL_STATE:
+                action_str += f"{agent} {action_parser.parse(action).to_natural_language()}"
+            elif agent_mental_state_generation[agent] == MentalStateGeneration.ZEROTH_ORDER_MENTAL_STATE:
+                response_parser = XMLParser(fields=["think", "response"], answer_field="response")
+                action_str += f"{agent}'s mental state: \"{parse_think(action, response_parser)}\"\n"
+                action_str += f"{agent} {parse_action(parse_response(action, response_parser), action_parser)}"
+            elif agent_mental_state_generation[agent] == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE:
+                response_parser = XMLParser(fields=["prediction", "think", "response"], answer_field="response")
+                action_str += f"{agent}'s mental state: \"{parse_prediction(action, response_parser)}\"\n"
+                action_str += f"{agent}'s reasoning: \"{parse_think(action, response_parser)}\"\n"
+                action_str += f"{agent} {parse_action(parse_response(action, response_parser), action_parser)}"
+            elif agent_mental_state_generation[agent] == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE_WITH_GROUND_TRUTH:
+                response_parser = XMLParser(fields=["think", "response"], answer_field="response")
+                action_str += f"{agent}'s mental state: \"{parse_think(action, response_parser)}\"\n"
+                action_str += f"{agent} {parse_action(parse_response(action, response_parser), action_parser)}"
+            else:
+                raise ValueError(f"Mental state generation {agent_mental_state_generation[agent]} is not supported.")
+    return action_str
+
+def parse_think(action: str, response_parser: XMLParser) -> str:
+      # If no reasoning_content, try to parse from result
+    parsed_response = response_parser.parse(action)
+    think = parsed_response.think
+    if think is None:
+        split_response = action.split(f"<response>")
+        if len(split_response) > 1:
+            think = split_response[0]
+        else:
+            think = action
+    return think
+
+def parse_response(action: str, response_parser: XMLParser) -> str:
+    parsed_response = response_parser.parse(action)
+    response = parsed_response.response
+    if response is None:
+        split_response = action.split(f"<response>")
+        if len(split_response) > 1:
+            response = split_response[-1]
+        else:
+            response = action
+    return response 
+
+def parse_prediction(action: str, response_parser: XMLParser) -> str:
+    parsed_response = response_parser.parse(action)
+    prediction = parsed_response.prediction
+    if prediction is None:
+        split_response = action.split(f"<think>")
+        if len(split_response) > 1:
+            prediction = split_response[0]
+    return prediction
+
+def parse_action(action: str, output_parser: PydanticOutputParser) -> str:
+    try:
+        return output_parser.parse(action).to_natural_language()
+    except Exception as e:
+        print(f"Error parsing action for string: {action} with error: {e}")
+        return action
+
+def _actions_to_natural_language_with_mental_state_for_viewer(actions: dict[str, str], viewer: str, agent_mental_state_generation: dict[str, MentalStateGeneration]) -> str:
+    action_str = ""
+    action_parser = PydanticOutputParser(pydantic_object=AgentAction)
+    for agent, action in actions.items():
+        if action.strip() != "":
+            if action_str != "":
+                action_str += ";"  # separate different agents with semicolon
+            is_viewer = agent == viewer
+            name_or_you = "You" if is_viewer else agent
+            if agent_mental_state_generation[agent] == MentalStateGeneration.NO_MENTAL_STATE:
+                action_str += f"{name_or_you} {action_parser.parse(action).to_natural_language()}"
+            elif agent_mental_state_generation[agent] == MentalStateGeneration.ZEROTH_ORDER_MENTAL_STATE:
+                response_parser = XMLParser(fields=["think", "response"], answer_field="response")
+                ms_label = "Your mental state" if is_viewer else f"{agent}'s mental state"
+                action_str += f"{ms_label}: \"{parse_think(action, response_parser)}\"\n"
+                action_str += f"{name_or_you} {parse_action(parse_response(action, response_parser), action_parser)}"
+            elif agent_mental_state_generation[agent] == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE:
+                response_parser = XMLParser(fields=["prediction", "think", "response"], answer_field="response")
+                ms_label = "Your mental state" if is_viewer else f"{agent}'s mental state"
+                reasoning_label = "Your reasoning" if is_viewer else f"{agent}'s reasoning"
+                action_str += f"{ms_label}: \"{parse_prediction(action, response_parser)}\"\n"
+                action_str += f"{reasoning_label}: \"{parse_think(action, response_parser)}\"\n"
+                action_str += f"{name_or_you} {parse_action(parse_response(action, response_parser), action_parser)}"
+            elif agent_mental_state_generation[agent] == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE_WITH_GROUND_TRUTH:
+                response_parser = XMLParser(fields=["think", "response"], answer_field="response")
+                ms_label = "Your mental state" if is_viewer else f"{agent}'s mental state"
+                action_str += f"{ms_label}: \"{parse_think(action, response_parser)}\"\n"
+                action_str += f"{name_or_you} {parse_action(parse_response(action, response_parser), action_parser)}"
+            else:
+                raise ValueError(f"Mental state generation {agent_mental_state_generation[agent]} is not supported.")
     return action_str
 
 
@@ -167,6 +277,7 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
         self.evaluators = evaluators
         self.terminal_evaluators = terminal_evaluators
         self.model_name = model_name
+        self.agent_mental_state_generation: dict[str, MentalStateGeneration] = {}
         # if an environment profile is provided, use it
         assert (
             env_profile or uuid_str
@@ -231,6 +342,8 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
                 p2_name=agent_names[1],
             )
 
+           
+
             if lite:
                 raw_background.p1_background = ""
                 raw_background.p2_background = ""
@@ -244,9 +357,13 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
                 p1_name=raw_background.p1_name,
                 p2_name=raw_background.p2_name,
             )
+            self.agent_mental_state_generation = {
+                self.background.p1_name: agents[self.background.p1_name].mental_state_generation,
+                self.background.p2_name: agents[self.background.p2_name].mental_state_generation,
+            }
         else:
             raise ValueError("agents must be provided")
-
+        
         self.agents = [self.background.p1_name, self.background.p2_name]
         agent_backgrounds = []
         if omniscient:
@@ -304,6 +421,7 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
                 available_actions=list(self.available_action_types)
                 if self.action_mask[0]
                 else ["none"],
+                last_turn_with_mental_state="",
             ),
             self.background.p2_name: Observation(
                 last_turn=background_for_b.to_natural_language(),
@@ -311,6 +429,7 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
                 available_actions=list(self.available_action_types)
                 if self.action_mask[1]
                 else ["none"],
+                last_turn_with_mental_state="",
             ),
         }
 
@@ -387,18 +506,19 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
             self.action_mask[random.randint(0, len(self.action_mask) - 1)] = True
         else:
             self.action_mask = [True for _ in self.agents]
-        obs = _actions_to_natural_language(complied_actions)
+        obs_for_a = _actions_to_natural_language_for_viewer(complied_actions, self.background.p1_name)
+        obs_for_b = _actions_to_natural_language_for_viewer(complied_actions, self.background.p2_name)
         return (
             {
                 self.background.p1_name: Observation(
-                    last_turn=render_text_for_agent(obs, agent_id=0),
+                    last_turn=render_text_for_agent(obs_for_a, agent_id=0),
                     turn_number=self.turn_number,
                     available_actions=list(self.available_action_types)
                     if self.action_mask[0]
                     else ["none"],
                 ),
                 self.background.p2_name: Observation(
-                    last_turn=render_text_for_agent(obs, agent_id=1),
+                    last_turn=render_text_for_agent(obs_for_b, agent_id=1),
                     turn_number=self.turn_number,
                     available_actions=list(self.available_action_types)
                     if self.action_mask[1]
@@ -442,7 +562,7 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
         )
 
     async def astep(
-        self, actions: dict[str, AgentAction] | dict[str, dict[str, int | str]]
+        self, actions: dict[str, AgentAction] | dict[str, dict[str, int | str]], **kwargs
     ) -> tuple[
         dict[str, Observation],
         dict[str, float],
@@ -452,7 +572,7 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
     ]:
         # Time step ++
         self.turn_number += 1
-
+        agent_messages_with_mental_state: dict[str, str] = kwargs.get("agent_messages_with_mental_state", {})
         # For action sampled from action space, it needs to be converted into AgentAction
         complied_actions: dict[str, AgentAction] = {}
         for key in actions.keys():
@@ -523,7 +643,10 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
             self.action_mask[random.randint(0, len(self.action_mask) - 1)] = True
         else:
             self.action_mask = [True for _ in self.agents]
-        obs = _actions_to_natural_language(complied_actions)
+        obs_for_a = _actions_to_natural_language_for_viewer(complied_actions, self.background.p1_name)
+        obs_for_b = _actions_to_natural_language_for_viewer(complied_actions, self.background.p2_name)
+        obs_with_mental_state_for_a = _actions_to_natural_language_with_mental_state_for_viewer(agent_messages_with_mental_state, self.background.p1_name, self.agent_mental_state_generation)
+        obs_with_mental_state_for_b = _actions_to_natural_language_with_mental_state_for_viewer(agent_messages_with_mental_state, self.background.p2_name, self.agent_mental_state_generation)
         info = {
             self.background.p1_name: {
                 "comments": response.comments or "",
@@ -542,18 +665,20 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
         return (
             {
                 self.background.p1_name: Observation(
-                    last_turn=render_text_for_agent(obs, agent_id=0),
+                    last_turn=render_text_for_agent(obs_for_a, agent_id=0),
                     turn_number=self.turn_number,
                     available_actions=list(self.available_action_types)
                     if self.action_mask[0]
                     else ["none"],
+                    last_turn_with_mental_state=obs_with_mental_state_for_a,
                 ),
                 self.background.p2_name: Observation(
-                    last_turn=render_text_for_agent(obs, agent_id=1),
+                    last_turn=render_text_for_agent(obs_for_b, agent_id=1),
                     turn_number=self.turn_number,
                     available_actions=list(self.available_action_types)
                     if self.action_mask[1]
                     else ["none"],
+                    last_turn_with_mental_state=obs_with_mental_state_for_b,
                 ),
             },
             {

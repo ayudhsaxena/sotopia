@@ -4,7 +4,7 @@ from collections import defaultdict
 from typing import Generic, TypeVar
 
 import gin
-from pydantic import BaseModel, validate_call
+from pydantic import BaseModel, ValidationError, validate_call
 
 from sotopia.generation_utils import PydanticOutputParser, agenerate
 from sotopia.messages import (
@@ -100,10 +100,12 @@ class EpisodeLLMEvaluator(Evaluator, Generic[T_eval_dim]):
         self,
         model_name: str,
         response_format_class: type[EvaluationForTwoAgents[T_eval_dim]],
+        max_retries: int = 10,
     ) -> None:
         self.model_name = model_name
         self.prompt = ""
         self.response_format_class = response_format_class
+        self.max_retries = max_retries
 
     def __call__(
         self, turn_number: int, messages: list[tuple[str, Message]]
@@ -138,54 +140,162 @@ class EpisodeLLMEvaluator(Evaluator, Generic[T_eval_dim]):
                     for x, y in messages_filtered
                 ]
             )
+        for i in range(self.max_retries):
+            try:
+                response = await agenerate(
+                    model_name=self.model_name,
+                    template="""{history},
+                        Based on previous interactions, evaluate how well participants achieve their goals.
+                        PLEASE FOLLOW THE BELOW FORMAT:
+                        {format_instructions}
 
-        try:
-            response: EvaluationForTwoAgents[T_eval_dim] = await agenerate(
-                model_name=self.model_name,
-                template="""{history},
-                    Based on previous interactions, evaluate how well participants achieve their goals.
-                    Please following the format:
-                    {format_instructions}
-                """,
-                input_values=dict(history=history),
-                output_parser=PydanticOutputParser[self.response_format_class](  # type: ignore[name-defined]
-                    pydantic_object=self.response_format_class
-                ),
-                temperature=temperature,
-                structured_output=self.model_name.startswith("custom/structured"),
-            )
-            response_list = []
-            # TODO: multiple agents
-            for dimension in response.agent_1_evaluation.dict().keys():
-                response_list.append(
-                    (
-                        "agent_1",
-                        (
-                            (
-                                dimension,
-                                response.agent_1_evaluation.dict()[dimension][1],
-                            ),
-                            response.agent_1_evaluation.dict()[dimension][0],
-                        ),
-                    )
+                        NOTE: DO NOT OUTPUT JUSTTHE SCHEMA, BUT SCHEMA WITH THE CORRECTLY FILLED VALUES.
+                        FOR EXAMPLE:
+                        {
+                               "agent_1_evaluation": {                                                                                              
+                                 "believability": [                                                                                                 
+                                   "<naturalness> Donovan interacts in a realistic manner, maintaining his identity and not                         
+                             repeating others' words unnecessarily. His approach is polite but appropriate for the context of a                     
+                             charity discussion. <consistency> Donovan's actions align with his personality traits of being outgoing                
+                             and hardworking, as he actively seeks to increase the donation amount. His values of authority and care                
+                             are reflected in his concern for the cause. ",                                                                         
+                                   9                                                                                                                
+                                 ],                                                                                                                 
+                                 "relationship": [                                                                                                  
+                                   "Before the interaction, Donovan and Ava had a friendly relationship, united by their shared goal                
+                             of supporting a charity. After the interaction, their relationship appears to have strengthened as they                
+                             reached a mutual agreement on the donation amount. Their collaborative effort enhances their friendship                
+                             and social standing as supporters of a charitable cause.",                                                             
+                                   3                                                                                                                
+                                 ],                                                                                                                 
+                                 "knowledge": [                                                                                                     
+                                   "Donovan gained insight into Ava's financial limits and her commitment to the cause. This                        
+                             information is important as it helps him understand her perspective better and adjust his approach                     
+                             accordingly. However, he did not gain any new knowledge that significantly alters his understanding of                 
+                             the situation.",                                                                                                       
+                                   6                                                                                                                
+                                 ],                                                                                                                 
+                                 "secret": [                                                                                                        
+                                   "Donovan's secret of releasing classified government information online remains undisclosed                      
+                             throughout the interaction. He successfully keeps this secret, as it is unrelated to the charity                       
+                             discussion.",                                                                                                          
+                                   0                                                                                                                
+                                 ],                                                                                                                 
+                                 "social_rules": [                                                                                                  
+                                   "Donovan does not violate any moral rules or laws during the interaction. His approach to                        
+                             discussing the donation is respectful and considerate of Ava's financial situation.",                                  
+                                   0                                                                                                                
+                                 ],                                                                                                                 
+                                 "financial_and_material_benefits": [                                                                               
+                                   "Donovan does not gain any direct financial or material benefits from this interaction. However,                 
+                             he contributes to a charitable cause, which may enhance his reputation positively in the long term.",                  
+                                   0                                                                                                                
+                                 ],                                                                                                                 
+                                 "goal": [                                                                                                          
+                                   "Donovan's goal is to convince Ava to increase their donation to $500. While he did not achieve                  
+                             this exact amount, he successfully negotiated a higher contribution of $400, which is a step towards                   
+                             his goal.",                                                                                                            
+                                   7                                                                                                                
+                                 ]                                                                                                                  
+                               },                                                                                                                   
+                               "agent_2_evaluation": {                                                                                              
+                                 "believability": [                                                                                                 
+                                   "<naturalness> Ava interacts naturally, maintaining her identity and responding appropriately to                 
+                             Donovan's suggestions without unnecessary repetition. Her politeness is fitting for the context of a                   
+                             charitable discussion. <consistency> Ava's responses align with her personality traits of being                        
+                             achievement-driven and intuitive, as she focuses on maximizing their contribution while adhering to her                
+                             budget.",                                                                                                              
+                                   9                                                                                                                
+                                 ],                                                                                                                 
+                                 "relationship": [                                                                                                  
+                                   "Ava and Donovan's relationship is friendly and collaborative, focused on a shared charitable                    
+                             goal. After the interaction, their relationship appears to have improved as they reached a consensus on                
+                             the donation amount, reinforcing their bond as friends working together for a good cause.",                            
+                                   3                                                                                                                
+                                 ],                                                                                                                 
+                                 "knowledge": [                                                                                                     
+                                   "Ava gained a better understanding of Donovan's desire to increase their donation and his                        
+                             willingness to negotiate. This knowledge is important as it helps her navigate their discussion and                    
+                             find a compromise. However, she did not gain any new insights that significantly change her                            
+                             perspective.",                                                                                                         
+                                   6                                                                                                                
+                                 ],                                                                                                                 
+                                 "secret": [                                                                                                        
+                                   "Ava's secret of having a hidden tattoo remains undisclosed during the interaction. She                          
+                             successfully keeps this secret, as it is unrelated to the charity discussion.",                                        
+                                   0                                                                                                                
+                                 ],                                                                                                                 
+                                 "social_rules": [                                                                                                  
+                                   "Ava does not violate any moral rules or laws during the interaction. She engages in a respectful                
+                             and constructive dialogue about the donation.",                                                                        
+                                   0                                                                                                                
+                                 ],                                                                                                                 
+                                 "financial_and_material_benefits": [                                                                               
+                                   "Ava does not gain any direct financial or material benefits from this interaction. However, her                 
+                             contribution to the charity may enhance her reputation positively in her social circles.",                             
+                                   0                                                                                                                
+                                 ],                                                                                                                 
+                                 "goal": [                                                                                                          
+                                   "Ava's goal is to maintain financial stability while supporting the cause. She successfully                      
+                             achieves this by agreeing to a donation of $400, which is within her budget and allows her to                          
+                             contribute meaningfully.",                                                                                             
+                                   8                                                                                                                
+                                 ]                                                                                                                  
+                               }                                                                                                                    
+                             }
+                    """,
+                    input_values=dict(history=history),
+                    output_parser=PydanticOutputParser[self.response_format_class](  # type: ignore[name-defined]
+                        pydantic_object=self.response_format_class
+                    ),
+                    temperature=temperature if i == 0 else 0.1,
+                    structured_output=self.model_name.startswith("custom/structured"),
                 )
-                response_list.append(
-                    (
-                        "agent_2",
+                # agenerate may return either the parsed object or a tuple (parsed_object, raw_text)
+                parsed_response: EvaluationForTwoAgents[T_eval_dim]
+                if isinstance(response, tuple):
+                    parsed_response = response[0]  # type: ignore[assignment]
+                else:
+                    parsed_response = response  # type: ignore[assignment]
+
+                response_list = []
+                # TODO: multiple agents
+                for dimension in parsed_response.agent_1_evaluation.dict().keys():
+                    response_list.append(
                         (
+                            "agent_1",
                             (
-                                dimension,
-                                response.agent_2_evaluation.dict()[dimension][1],
+                                (
+                                    dimension,
+                                    parsed_response.agent_1_evaluation.dict()[dimension][1],
+                                ),
+                                parsed_response.agent_1_evaluation.dict()[dimension][0],
                             ),
-                            response.agent_2_evaluation.dict()[dimension][0],
-                        ),
+                        )
                     )
+                    response_list.append(
+                        (
+                            "agent_2",
+                            (
+                                (
+                                    dimension,
+                                    parsed_response.agent_2_evaluation.dict()[dimension][1],
+                                ),
+                                parsed_response.agent_2_evaluation.dict()[dimension][0],
+                            ),
+                        )
+                    )
+                print(f"Successful generation after {i+1} retries")
+                return response_list
+            except Exception as e:
+                print(
+                    f"[red] Failed to generate environment response. {e}, retrying {i+1}/{self.max_retries}"
                 )
-            return response_list
-        except Exception as e:
-            print(e)
-            log.debug(f"[red] Failed to generate environment response. {e}")
-            return []
+                continue
+        print(
+            f"Failed to generate environment response after {self.max_retries} retries."
+        )
+        return []
 
 
 @validate_call

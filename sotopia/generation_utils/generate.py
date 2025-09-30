@@ -20,6 +20,7 @@ from sotopia.messages.message_classes import (
     ScriptInteractionReturnType,
 )
 from sotopia.generation_utils.xml_parser import XMLParser
+from sotopia.generation_utils.enums import MentalStateGeneration
 from sotopia.utils import format_docstring
 
 
@@ -65,6 +66,24 @@ For example:
 <response>{{"action_type": "speak", "argument": "Hello, how are you?"}}</response>
 """
 
+MODIFIED_SOTOPIA_PROMPT = """
+You are a participant in a social interaction scenario, and your goal is to engage in natural, meaningful conversation while working towards your assigned objective. At every conversation turn between you and the other participant, first predict the thinking process of the other participant. That is, given the other participant's latest response, answer the following question - What is the other participant's thought process behind their latest response? Put the answer to this question within the <prediction></prediction> tags. ALWAYS begin your answer with 'I think the other participant is thinking that...'.
+
+Then based on your prediction of what the other participant is thinking, think through different ways to respond and choose the most suitable one. Output your final response within the <response></response> tags.
+
+The content inside the <response></response> tags should be a valid JSON object with the actual values following the JSON schema provided and NOT the JSON schema itself.
+
+Your response should have the following format:
+<prediction>...</prediction>
+<think>...</think>
+<response>...</response>
+
+For example:
+<prediction>I think the other participant is thinking that I'm being too formal and they want to have a more casual conversation.</prediction>
+<think>Based on this prediction, I should be more relaxed and friendly in my response to match their conversational style.</think>
+<response>{{"action_type": "speak", "argument": "Hey, how's it going? Nice to meet you!"}}</response>
+"""
+
 @validate_call
 async def format_bad_output(
     ill_formed_output: str,
@@ -78,7 +97,7 @@ async def format_bad_output(
 
     Format instructions: {format_instructions}
 
-    Please only generate the JSON:
+    PLEASE ONLY GENERATE THE JSON:
     """
 
     input_values = {
@@ -86,14 +105,25 @@ async def format_bad_output(
         "format_instructions": format_instructions,
     }
     content = template.format(**input_values)
+    if model_name.startswith("custom"):
+        base_url, api_key = (
+            model_name.split("@")[1],
+            os.environ.get("CUSTOM_API_KEY", "EMPTY"),
+        )
+        model_name = model_name.split("@")[0].replace("custom/", "openai/")
+    else:
+        base_url = None
+        api_key = None
     response = await acompletion(
         model=model_name,
         response_format={"type": "json_object"},
         messages=[{"role": "user", "content": content}],
-    )
+        base_url=base_url,
+        api_key=api_key,
+    )   
     reformatted_output = response.choices[0].message.content
     assert isinstance(reformatted_output, str)
-    log.info(f"Reformated output: {reformatted_output}")
+    # log.info(f"Reformated output: {reformatted_output}")
     return reformatted_output
 
 
@@ -108,11 +138,12 @@ async def agenerate(
     structured_output: bool = False,
     bad_output_process_model: str | None = None,
     use_fixed_model_version: bool = True,
-    use_prediction: bool = False,   
+    mental_state_generation: MentalStateGeneration = MentalStateGeneration.NO_MENTAL_STATE,
 ) -> OutputType | tuple[AgentAction | OutputType, str]:
 
     """Generate text using LiteLLM instead of Langchain."""
-    response_parser = XMLParser(fields=["think", "response"], answer_field="response")
+    response_parser = get_response_parser(mental_state_generation)
+
     # Format template with input values
     if "format_instructions" not in input_values:
         input_values["format_instructions"] = output_parser.get_format_instructions()
@@ -123,7 +154,7 @@ async def agenerate(
     # Replace template variables
     for key, value in input_values.items():
         template = template.replace(f"{{{key}}}", str(value))
-
+    original_model_name = model_name
     if model_name.startswith("custom"):
         base_url, api_key = (
             model_name.split("@")[1],
@@ -163,9 +194,9 @@ async def agenerate(
 
         assert isinstance(result, str)
         return cast(OutputType, output_parser.parse(result))
-    if use_prediction:
+    if mental_state_generation != MentalStateGeneration.NO_MENTAL_STATE:
         messages = [
-            {"role": "system", "content": SOTOPIA_PROMPT},
+            {"role": "system", "content": get_system_prompt(mental_state_generation)},
             {"role": "user", "content": template},
         ]
     else:   
@@ -179,9 +210,9 @@ async def agenerate(
         api_key=api_key,
     )
     result = response.choices[0].message.content
-
-    if use_prediction:
-        return perform_output_parsing(response, output_parser, response_parser)
+    
+    if mental_state_generation != MentalStateGeneration.NO_MENTAL_STATE:
+        return perform_output_parsing(response, output_parser, response_parser=response_parser)
     else:
         try:
             parsed_result = output_parser.parse(result)
@@ -196,15 +227,16 @@ async def agenerate(
             reformat_result = await format_bad_output(
                 result,
                 output_parser.get_format_instructions(),
-                bad_output_process_model or model_name,
+                bad_output_process_model or original_model_name,
                 use_fixed_model_version,
             )
             parsed_result = output_parser.parse(reformat_result)
+    
+    #log.info(f"Generated result: {result}")
 
-    log.info(f"Generated result: {parsed_result}")
-    return parsed_result
+    return parsed_result, result
 
-def perform_output_parsing(response, output_parser, response_parser) -> tuple[AgentAction | OutputType, str]:
+def perform_output_parsing(response, output_parser, response_parser: XMLParser) -> tuple[AgentAction | OutputType, str]:
     result = response.choices[0].message.content
 
     # Check if the response has reasoning_content (API-parsed thinking)
@@ -237,7 +269,9 @@ def perform_output_parsing(response, output_parser, response_parser) -> tuple[Ag
     
     try:
         parsed_result = output_parser.parse(action)
-        return parsed_result, think
+        # log.info(f"Raw result: {result}")
+        # log.info(f"Parsed result: {parsed_result}")
+        return parsed_result, result
     except Exception as e:
         if isinstance(output_parser, ScriptOutputParser):
             raise e
@@ -246,7 +280,7 @@ def perform_output_parsing(response, output_parser, response_parser) -> tuple[Ag
             extra={"markup": True},
         )
         agent_action = AgentAction(action_type="speak", argument=action)
-        return agent_action, think
+        return agent_action, result
 
 @gin.configurable
 @validate_call
@@ -317,7 +351,7 @@ async def agenerate_action(
     action_types: list[ActionType],
     agent: str,
     goal: str,
-    use_prediction: bool = False,
+    mental_state_generation: MentalStateGeneration = MentalStateGeneration.NO_MENTAL_STATE,
     temperature: float = 0.7,
     script_like: bool = False,
     bad_output_process_model: str | None = None,
@@ -328,63 +362,9 @@ async def agenerate_action(
     """
     try:
         if script_like:
-            # model as playwright
-            template = """
-                Now you are a famous playwright, your task is to continue writing one turn for agent {agent} under a given background and history to help {agent} reach social goal. Please continue the script based on the previous turns. You can only generate one turn at a time.
-                You can find {agent}'s background and goal in the 'Here is the context of the interaction' field.
-                You should try your best to achieve {agent}'s goal in a way that align with their character traits.
-                Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
-                {history}.
-                The script has proceeded to Turn #{turn_number}. Current available action types are
-                {action_list}.
-                Note: The script can be ended if 1. one agent have achieved social goals, 2. this conversation makes the agent uncomfortable, 3. the agent find it uninteresting/you lose your patience, 4. or for other reasons you think it should stop.
-
-                Your action should follow the given format:
-                {format_instructions}
-
-                IMPORTANT: You must output ONLY a valid JSON object with the actual values, NOT the JSON schema. 
-                For example, output: {{"action_type": "speak", "argument": "Hello, how are you?"}}
-            """
+            template = get_action_template(MentalStateGeneration.NO_MENTAL_STATE)
         else:
-            # Normal case, model as agent
-            if use_prediction:
-                template = """
-                    Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
-                    You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
-                    Note that {agent}'s goal is only visible to you.
-                    You should try your best to achieve {agent}'s goal in a way that align with their character traits. 
-                    Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
-                    {history}.
-                    You are at Turn #{turn_number}. Your available action types are
-                    {action_list}.
-                    Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
-
-                    Your action (within the <response></response> tags) should follow the given format:
-                    {format_instructions}
-
-                    IMPORTANT: The output inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema. 
-                    For example, output: 
-                    <think>Doing some thinking here</think>
-                    <response>{{"action_type": "speak", "argument": "Hello, how are you?"}}</response>
-                    """
-            else:
-                template = """
-                    Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
-                    You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
-                    Note that {agent}'s goal is only visible to you.
-                    You should try your best to achieve {agent}'s goal in a way that align with their character traits.
-                    Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
-                    {history}.
-                    You are at Turn #{turn_number}. Your available action types are
-                    {action_list}.
-                    Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
-
-                    Your action should follow the given format:
-                    {format_instructions}
-
-                    IMPORTANT: You must output ONLY a valid JSON object with the actual values, NOT the JSON schema. 
-                    For example, output: {{"action_type": "speak", "argument": "Hello, how are you?"}}
-                """
+            template = get_action_template(mental_state_generation)
         return await agenerate(
             model_name=model_name,
             template=template,
@@ -398,7 +378,7 @@ async def agenerate_action(
             temperature=temperature,
             bad_output_process_model=bad_output_process_model,
             use_fixed_model_version=use_fixed_model_version,
-            use_prediction=use_prediction,
+            mental_state_generation=mental_state_generation,
         )
     except Exception as e:
         if "Model output JSON schema instead of actual data" in str(e):
@@ -406,6 +386,104 @@ async def agenerate_action(
         else:
             log.warning(f"Failed to generate action due to {e}")
         return AgentAction(action_type="none", argument="")
+
+def get_action_template(mental_state_generation: MentalStateGeneration) -> str:
+
+    template = """
+        You are {agent}.
+        You can find your goal (or background) in the 'Here is the context of the interaction' field.
+        Note that your goal is only visible to you.
+        You should try your best to achieve your goal in a way that aligns with your character traits. 
+        {history}.
+        You are at Turn #{turn_number}. Your available action types are
+        {action_list}.
+        Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
+
+        Your action (within the <response></response> tags) should follow the given format:
+        {format_instructions}
+
+        IMPORTANT: The output inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema.
+        """
+    
+    if mental_state_generation == MentalStateGeneration.NO_MENTAL_STATE:
+        return template + """For example, output: {{"action_type": "speak", "argument": "Hello, how are you?"}}"""
+    elif mental_state_generation == MentalStateGeneration.ZEROTH_ORDER_MENTAL_STATE:
+        return template + """For example, output: 
+        <think>I think I'm running out of time for my next meeting. I need to wrap this up, but I don't want to be rude. I'll suggest we move on.</think>
+        <response>{{"action_type": "speak", "argument": This has been really productive. Just looking at the clock, I want to make sure we get to the final point. How about we move on to that now?"}}</response>
+        """
+    elif mental_state_generation == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE:
+        return template + """For example, output: 
+        <prediction>I think the other participant is thinking that I'm being too formal and they want to have a more casual conversation.</prediction>
+        <think>Based on this prediction, I should be more relaxed and friendly in my response to match their conversational style.</think>
+        <response>{{"action_type": "speak", "argument": "Hey, how's it going? Nice to meet you!"}}</response>
+        """ 
+    elif mental_state_generation == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE_WITH_GROUND_TRUTH:
+        return template + """For example, output: 
+        <think>They seem rushed and worried about time. Therefore I should keep my reply brief and propose moving to the next step.</think>
+        <response>{{"action_type": "speak", "argument": "Sounds good—let's jump to the next step to stay on track."}}</response>
+        """
+    else:
+        return template + """For example, output: {{"action_type": "speak", "argument": "Hello, how are you?"}}"""
+
+def get_response_parser(mental_state_generation: MentalStateGeneration) -> XMLParser:
+    if mental_state_generation == MentalStateGeneration.NO_MENTAL_STATE:
+        return None
+    if mental_state_generation == MentalStateGeneration.ZEROTH_ORDER_MENTAL_STATE:
+        return XMLParser(fields=["think", "response"], answer_field="response")
+    elif mental_state_generation == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE:
+        return XMLParser(fields=["prediction", "think", "response"], answer_field="response")
+    elif mental_state_generation == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE_WITH_GROUND_TRUTH:
+        return XMLParser(fields=["think", "response"], answer_field="response")
+    else:
+        raise ValueError(f"Mental state generation {mental_state_generation} is not supported.")
+
+def get_system_prompt(mental_state_generation: MentalStateGeneration) -> str:
+    if mental_state_generation == MentalStateGeneration.ZEROTH_ORDER_MENTAL_STATE:
+        return """You are a participant in a social interaction scenario. Your goal is to engage in natural, meaningful conversation while working towards your assigned goal. Before you respond, describe your own current mental state inside the <think></think> tag. Your mental state is essentially what you believe, feel, want, desire, need, know etc. Then output your final action ONLY as a JSON object within the <response></response> tags based on this mental state.
+        Respond in the following format:
+        <think>...</think>
+        <response>...</response>
+
+        The content inside the <response></response> tags should be a valid JSON object with the actual values following the JSON schema provided and NOT the JSON schema itself. 
+        For example:
+        <think>I think I'm running out of time for my next meeting. I need to wrap this up, but I don't want to be rude. I'll suggest we move on.</think>
+        <response>{{"action_type": "speak", "argument": This has been really productive. Just looking at the clock, I want to make sure we get to the final point. How about we move on to that now?"}}</response>
+        """
+    elif mental_state_generation == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE:
+        return """You are a participant in a social interaction scenario, and your goal is to engage in natural, meaningful conversation while working towards your assigned goal. At every conversation turn between you and the other participant, first predict the thinking process of the other participant. That is, given the other participant's latest response, answer the following question - What is the other participant's thought process behind their latest response? Put the answer to this question within the <prediction></prediction> tags. ALWAYS begin your answer with 'I think the other participant is thinking that...'.
+        Then based on your prediction of what the other participant is thinking, think through different ways to respond and choose the most suitable one. Output your final response within the <response></response> tags.
+        The content inside the <response></response> tags should be a valid JSON object with the actual values following the JSON schema provided and NOT the JSON schema itself.
+
+        Your response should have the following format:
+        <prediction>...</prediction>
+        <think>...</think>
+        <response>...</response>
+
+        For example:
+        <prediction>I think the other participant is thinking that I'm being too formal and they want to have a more casual conversation.</prediction>
+        <think>Based on this prediction, I should be more relaxed and friendly in my response to match their conversational style.</think>
+        <response>{{"action_type": "speak", "argument": "Hey, how's it going? Nice to meet you!"}}</response>
+        """
+    elif mental_state_generation == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE_WITH_GROUND_TRUTH:
+        return """You are a participant in a social interaction scenario, and your goal is to engage in natural, meaningful conversation while working towards your assigned goal. At every conversation turn, you will be given the other participant's mental state.
+        The mental state of a person is essentially what they believe, feel, want, desire, need, know etc.
+        First, given these mental states of the other participant, inside the <think></think> tags, briefly explain your understanding of the other participant's mental state. Then reiterate what your goal is and reason about what you should do to achieve your goal based on this understanding. 
+        Finally, within the <response></response> tags, output your action which is a JSON object. The content inside the <response></response> tags should be a valid JSON object with the actual values following the JSON schema provided and NOT the JSON schema itself.
+
+        Your response should have the following format:
+        <think>...</think>
+        <response>...</response>
+
+        For example:
+        Ending part of the interaction history:
+        <Agent B>'s mental state: "I'm running out of time for my next meeting. I need to wrap this up, but I don't want to be rude. I'll suggest we move on."
+        <Agent B> said: "This has been really productive. Just looking at the clock, I want to make sure we get to the final point. How about we move on to that now?"
+        
+        Your output:
+        <think>They seem rushed and worried about time. Therefore I should keep my reply brief and propose moving to the next step.</think>
+        <response>{{"action_type": "speak", "argument": "Sounds good—let's jump to the next step to stay on track."}}</response>
+        """
 
 
 @gin.configurable

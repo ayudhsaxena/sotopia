@@ -29,7 +29,7 @@ class PydanticOutputParser(OutputParser[T], Generic[T]):
 
     def parse(self, result: str) -> T:
         json_result = json_repair.loads(result)
-        assert isinstance(json_result, dict)
+        assert isinstance(json_result, dict), f"Expected dict, got {json_result}"
         
         # Check if the model output the schema instead of actual data
         # This happens when the model gets confused and outputs the JSON schema

@@ -30,6 +30,7 @@ from sotopia.messages.message_classes import (
     ScriptEnvironmentResponse,
 )
 from sotopia.samplers import BaseSampler, EnvAgentCombo
+from sotopia.generation_utils.enums import MentalStateGeneration
 
 
 @validate_call
@@ -133,7 +134,7 @@ async def arun_one_episode(
         environment_messages = env.reset(agents=agents, omniscient=omniscient)
         agents.reset()
         messages: list[list[tuple[str, str, Message]]] = []
-
+        raw_messages = []
         # Main Event Loop
         done = False
         messages.append(
@@ -151,13 +152,30 @@ async def arun_one_episode(
         reasons: list[str] = []
         while not done:
             # gather agent messages
-            agent_messages: dict[str, AgentAction] = dict()
-            actions = await asyncio.gather(
+            agent_messages: dict[str, AgentAction] = {}
+
+            # Call aact for each agent, await all results, then take the first item
+            # if the coroutine returns a tuple (e.g. (AgentAction, think)), otherwise
+            # use the result directly.
+            aact_results = await asyncio.gather(
                 *[
-                    agents[agent_name].aact(environment_messages[agent_name])
+                    agents[agent_name].aact(
+                        environment_messages[agent_name]
+                    )
                     for agent_name in env.agents
                 ]
             )
+
+            actions = [
+                res[0] if isinstance(res, tuple) else res  # type: ignore[index]
+                for res in aact_results
+            ]
+           
+            for idx, res in enumerate(aact_results):
+                msg = res[1] if isinstance(res, tuple) else res  # type: ignore[index]
+                if isinstance(msg, str) and msg.strip() != "":
+                    agent_name = env.agents[idx]
+                    raw_messages.append(f"{agent_name}: {msg}")
             if script_like:
                 # manually mask one message
                 agent_mask = env.action_mask
@@ -195,7 +213,6 @@ async def arun_one_episode(
                 " ".join(info[agent_name]["comments"] for agent_name in env.agents)
             )
             done = all(terminated.values())
-
         epilog = EpisodeLog(
             environment=env.profile.pk,
             agents=[agent.profile.pk for agent in agent_list],
@@ -207,8 +224,157 @@ async def arun_one_episode(
             ],
             reasoning=info[env.agents[0]]["comments"],
             rewards=[info[agent_name]["complete_rating"] for agent_name in env.agents],
+            raw_messages=raw_messages,
         )
+        if streaming:
+            # yield the rewards and reasonings
+            messages.append(
+                [("Evaluation", "Rewards", SimpleMessage(message=str(epilog.rewards)))]
+            )
+            messages.append(
+                [("Evaluation", "Reasoning", SimpleMessage(message=epilog.reasoning))]
+            )
+            yield messages
 
+        if push_to_db:
+            try:
+                if episode_pk:
+                    epilog.pk = episode_pk
+                    epilog.save()
+                else:
+                    epilog.save()
+                if simulation_status:
+                    simulation_status.status = "Completed"
+                    simulation_status.save()
+            except Exception as e:
+                logging.error(f"Failed to save episode log: {e}")
+
+    if streaming:
+        return generate_messages()
+    else:
+        async for last_messages in generate_messages():
+            pass
+        return flatten_listed_messages(last_messages)
+
+@gin.configurable
+async def arun_one_episode_with_mental_state_generation(
+    env: ParallelSotopiaEnv,
+    agent_list: Sequence[BaseAgent[Observation, AgentAction]],
+    omniscient: bool = False,
+    script_like: bool = False,
+    json_in_script: bool = False,
+    tag: str | None = None,
+    push_to_db: bool = False,
+    episode_pk: str | None = None,
+    streaming: bool = False,
+    simulation_status: NonStreamingSimulationStatus | None = None,
+) -> Union[
+    list[tuple[str, str, Message]],
+    AsyncGenerator[list[list[tuple[str, str, Message]]], None],
+]:
+    agents = Agents({agent.agent_name: agent for agent in agent_list})
+
+    async def generate_messages() -> (
+        AsyncGenerator[list[list[tuple[str, str, Message]]], None]
+    ):
+        environment_messages = env.reset(agents=agents, omniscient=omniscient)
+        agents.reset()
+        messages: list[list[tuple[str, str, Message]]] = []
+        raw_messages = []
+        # Main Event Loop
+        done = False
+        messages.append(
+            [
+                ("Environment", agent_name, environment_messages[agent_name])
+                for agent_name in env.agents
+            ]
+        )
+        yield messages
+
+        # set goal for agents
+        for index, agent_name in enumerate(env.agents):
+            agents[agent_name].goal = env.profile.agent_goals[index]
+        rewards: list[list[float]] = []
+        reasons: list[str] = []
+        while not done:
+
+            # gather agent messages
+            agent_messages: dict[str, AgentAction] = {}
+            agent_messages_with_mental_state: dict[str, str] = {}
+            # Call aact for each agent, await all results, then take the first item
+            # if the coroutine returns a tuple (e.g. (AgentAction, think)), otherwise
+            # use the result directly.
+            aact_results = await asyncio.gather(
+                *[
+                    agents[agent_name].aact(
+                        environment_messages[agent_name]
+                    )
+                    for agent_name in env.agents
+                ]
+            )
+
+            actions = [
+                res[0] if isinstance(res, tuple) else res  # type: ignore[index]
+                for res in aact_results
+            ]
+           
+            for idx, res in enumerate(aact_results):
+                msg = res[1] if isinstance(res, tuple) else res  # type: ignore[index]
+                agent_name = env.agents[idx]
+                agent_messages_with_mental_state[agent_name] = msg
+                if msg.strip() != "":
+                    raw_messages.append(f"{agent_name}: {msg}")
+            if script_like:
+                # manually mask one message
+                agent_mask = env.action_mask
+                for idx in range(len(agent_mask)):
+                    if agent_mask[idx] == 0:
+                        actions[idx] = AgentAction(action_type="none", argument="")
+                    else:
+                        pass
+
+            # actions = cast(list[AgentAction], actions)
+            for idx, agent_name in enumerate(env.agents):
+                agent_messages[agent_name] = actions[idx]
+
+                messages[-1].append(
+                    (agent_name, "Environment", agent_messages[agent_name])
+                )
+
+            # send agent messages to environment
+            (
+                environment_messages,
+                rewards_in_turn,
+                terminated,
+                ___,
+                info,
+            ) = await env.astep(agent_messages, agent_messages_with_mental_state=agent_messages_with_mental_state)
+            messages.append(
+                [
+                    ("Environment", agent_name, environment_messages[agent_name])
+                    for agent_name in env.agents
+                ]
+            )
+            yield messages
+            rewards.append([rewards_in_turn[agent_name] for agent_name in env.agents])
+            reasons.append(
+                " ".join(info[agent_name]["comments"] for agent_name in env.agents)
+            )
+            done = all(terminated.values())
+        epilog = EpisodeLog(
+            environment=env.profile.pk,
+            agents=[agent.profile.pk for agent in agent_list],
+            tag=tag,
+            models=[env.model_name, agent_list[0].model_name, agent_list[1].model_name],
+            messages=[
+                [(m[0], m[1], m[2].to_natural_language()) for m in messages_in_turn]
+                for messages_in_turn in messages
+            ],
+            reasoning=info[env.agents[0]]["comments"],
+            rewards=[info[agent_name]["complete_rating"] for agent_name in env.agents],
+            raw_messages=raw_messages,
+            agent_observation_history=[agent.get_interaction_history_for_a_mental_state_window(turn_number=len(raw_messages)+i, mental_state_window=len(raw_messages)) for i,agent in enumerate(agent_list)],
+        )
         if streaming:
             # yield the rewards and reasonings
             messages.append(
@@ -315,12 +481,14 @@ async def run_async_server(
             n_agent=len(agents_model_dict),
             env_params=env_params,
             agents_params=[
-                {"model_name": model_name} if model_name != "human" else {}
-                for model_name in agents_model_dict.values()
+                {'mental_state_generation': MentalStateGeneration.FIRST_ORDER_MENTAL_STATE_WITH_GROUND_TRUTH,
+                'model_name': agents_model_dict["agent1"]} ,
+                {'mental_state_generation': MentalStateGeneration.ZEROTH_ORDER_MENTAL_STATE,
+                'model_name': agents_model_dict["agent2"]} ,
             ],
         )
     episode_futures = [
-        arun_one_episode(
+        arun_one_episode_with_mental_state_generation(
             env=env_agent_combo[0],
             agent_list=env_agent_combo[1],
             omniscient=omniscient,
@@ -442,7 +610,7 @@ async def arun_one_script(
 
 async def aevaluate_one_episode(
     episode: EpisodeLog,
-    model: str = "gpt-4",
+    model: str = "gpt-4o-mini",
     tag: str | None = None,
     push_to_db: bool = False,
 ) -> None:

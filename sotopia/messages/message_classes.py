@@ -33,12 +33,16 @@ class Observation(Message):
     last_turn: str = Field(description="the last turn of the conversation")
     turn_number: int = Field(description="the turn number of the conversation")
     available_actions: list[ActionType] = Field(description="the available actions")
+    last_turn_with_mental_state: str = Field(description="the last turn of the conversation with mental state")
 
-    def to_natural_language(self) -> str:
+    def to_natural_language(self, use_mental_state: bool = False) -> str:
         if self.turn_number == 0:
             return f"\n{self.last_turn}\nConversation Starts:\n"
         else:
-            return f"Turn #{self.turn_number-1}: {self.last_turn}\n"
+            if use_mental_state:
+                return f"Turn #{self.turn_number-1}: {self.last_turn_with_mental_state}\n"
+            else:
+                return f"Turn #{self.turn_number-1}: {self.last_turn}\n"
 
 
 class ScriptBackground(Message):
