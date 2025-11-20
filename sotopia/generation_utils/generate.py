@@ -243,6 +243,8 @@ def perform_output_parsing(response, output_parser, response_parser: XMLParser) 
     think = None
     if hasattr(response.choices[0].message, 'reasoning_content') :
         think = response.choices[0].message.reasoning_content
+        result = f"<think>{think}</think>{result}"
+
 
     # If no reasoning_content, try to parse from result
     if think is None:
@@ -451,9 +453,10 @@ def get_system_prompt(mental_state_generation: MentalStateGeneration) -> str:
         <response>{{"action_type": "speak", "argument": This has been really productive. Just looking at the clock, I want to make sure we get to the final point. How about we move on to that now?"}}</response>
         """
     elif mental_state_generation == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE:
-        return """You are a participant in a social interaction scenario, and your goal is to engage in natural, meaningful conversation while working towards your assigned goal. At every conversation turn between you and the other participant, first predict the thinking process of the other participant. That is, given the other participant's latest response, answer the following question - What is the other participant's thought process behind their latest response? Put the answer to this question within the <prediction></prediction> tags. ALWAYS begin your answer with 'I think the other participant is thinking that...'.
-        Then based on your prediction of what the other participant is thinking, think through different ways to respond and choose the most suitable one. Output your final response within the <response></response> tags.
-        The content inside the <response></response> tags should be a valid JSON object with the actual values following the JSON schema provided and NOT the JSON schema itself.
+        return """You are a participant in a social interaction scenario, and your goal is to engage in natural, meaningful conversation while working towards your assigned goal. At every conversation turn between you and the other participant, first predict the mental state of the other participant.
+        The mental state of a person is essentially what they believe, feel, want, desire, need, know etc. So given the other participant's latest and past responses, predict their mental state. That is, answer the following question - What is the other participant's current mental state? Put the answer to this question within the <prediction></prediction> tags. ALWAYS begin your answer with 'I think the other participant is thinking that...'.
+        Then, inside the <think></think> tags, briefly explain your understanding of the other participant's predicted mental state. Then reiterate what your goal is and reason about what you should do to achieve your goal based on this understanding.
+        Finally, within the <response></response> tags, output your action which is a JSON object. The content inside the <response></response> tags should be a valid JSON object with the actual values following the JSON schema provided and NOT the JSON schema itself.
 
         Your response should have the following format:
         <prediction>...</prediction>
@@ -461,9 +464,13 @@ def get_system_prompt(mental_state_generation: MentalStateGeneration) -> str:
         <response>...</response>
 
         For example:
-        <prediction>I think the other participant is thinking that I'm being too formal and they want to have a more casual conversation.</prediction>
-        <think>Based on this prediction, I should be more relaxed and friendly in my response to match their conversational style.</think>
-        <response>{{"action_type": "speak", "argument": "Hey, how's it going? Nice to meet you!"}}</response>
+        Ending part of the interaction history:
+        <Agent B> said: "<Agent B> said: "This has been really productive. Just looking at the clock, I want to make sure we get to the final point. How about we move on to that now?""
+        
+        Your output:
+        <prediction>I think the other participant is thinking that they are running out of time and want to quickly wrap up the conversation.</prediction>
+        <think>They seem rushed and worried about time. Therefore I should keep my reply brief and propose moving to the next step.</think>
+        <response>{{"action_type": "speak", "argument": "Sounds good—let's jump to the next step to stay on track."}}</response>
         """
     elif mental_state_generation == MentalStateGeneration.FIRST_ORDER_MENTAL_STATE_WITH_GROUND_TRUTH:
         return """You are a participant in a social interaction scenario, and your goal is to engage in natural, meaningful conversation while working towards your assigned goal. At every conversation turn, you will be given the other participant's mental state.

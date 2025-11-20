@@ -8,6 +8,7 @@ from sotopia.generation_utils.generate import (
     agenerate_action,
     agenerate_goal,
     agenerate_script,
+    get_action_template,
 )
 from sotopia.messages import AgentAction, Observation
 from sotopia.messages.message_classes import ScriptBackground
@@ -131,7 +132,6 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
     def build_action_prompt(
         self,
         obs: Observation,
-        use_prediction: bool = False,
     ) -> str:
         """Return the fully formatted template used for action generation.
 
@@ -140,61 +140,12 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
         obs : Observation
             The current observation provided by the environment.
         """
-
-
-        history = "\n".join(
-            f"{y.to_natural_language()}" for _, y in self.inbox
-        )
-        if use_prediction:
-            template = """
-                You are {agent}. Think and speak as yourself.
-                Always use first-person pronouns (I, me, my, mine). Never refer to yourself in the third person or by your full name.
-                You can find your goal (or background) in the 'Here is the context of the interaction' field.
-                Note that your goal is only visible to you.
-                You should try your best to achieve your goal in a way that aligns with your character traits.
-                Additionally, maintain the conversation's naturalness and realism (e.g., do not repeat what the other person has already said).
-                {history}.
-                You are at Turn #{turn_number}. Your available action types are
-                {action_list}.
-                Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
-
-                Your action (within the <response></response> tags) should follow the given format:
-                {format_instructions}
-
-                IMPORTANT:
-                - Write your content inside <prediction>, <think>, and <response> from your own perspective using first person.
-                - The content inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema. 
-                For example, output: 
-                <prediction>I think the other participant is thinking that I'm being too formal and they want to have a more casual conversation.</prediction>
-                <think>Based on this prediction, I should be more relaxed and friendly in my response to match their conversational style.</think>
-                <response>{{"action_type": "speak", "argument": "Hey, how's it going? Nice to meet you!"}}</response>
-            """
-        else:
-            template = """
-                You are {agent}. Think and speak as yourself.
-                Always use first-person pronouns (I, me, my, mine). Never refer to yourself in the third person or by your full name.
-                You can find your goal (or background) in the 'Here is the context of the interaction' field.
-                Note that your goal is only visible to you.
-                You should try your best to achieve your goal in a way that aligns with your character traits.
-                Additionally, maintain the conversation's naturalness and realism (e.g., do not repeat what the other person has already said).
-                {history}.
-                You are at Turn #{turn_number}. Your available action types are
-                {action_list}.
-                Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
-
-                Your action (within the <response></response> tags) should follow the given format:
-                {format_instructions}
-
-                IMPORTANT:
-                - Write your content inside <think> (if any) and <response> from your own perspective using first person.
-                - The content inside the <response></response> tags should be ONLY a valid JSON object with the actual values, NOT the JSON schema. 
-                For example, output: 
-                <think>Doing some thinking here</think>
-                <response>{{"action_type": "speak", "argument": "Hello, how are you?"}}</response>
-            """
-        # Template identical to that in `agenerate_action`
+        # Use the new interaction history method that respects mental_state_generation and mental_state_window
+        history = self.get_interaction_history(obs.turn_number)
+        
+        # Get the template based on mental_state_generation
+        template = get_action_template(self.mental_state_generation)
        
-
         output_parser = PydanticOutputParser(pydantic_object=AgentAction)
 
         filled_prompt = template.format(
