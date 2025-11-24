@@ -12,6 +12,7 @@ from sotopia.messages import (
     Message,
     ScriptEnvironmentResponse,
 )
+from sotopia.database.evaluation_dimensions import GoalDimension, GoalDimensionDiscrete
 
 log = logging.getLogger("evaluators")
 
@@ -114,37 +115,16 @@ class EpisodeLLMEvaluator(Evaluator, Generic[T_eval_dim]):
             "ReachGoalLLMEvaluator is not implemented for synchronous evaluation"
         )
 
-    @gin.configurable
-    @validate_call
-    async def __acall__(
-        self,
-        turn_number: int,
-        messages: list[tuple[str, Message]] | None,
-        history: str = "",
-        temperature: float = 0.0,
-    ) -> list[tuple[str, tuple[tuple[str, int | float | bool], str]]]:
-        # filter did nothing
-        if not history and messages:
-            messages_filtered = [
-                (x, y)
-                for x, y in messages
-                if "did nothing" not in y.to_natural_language()
-            ]
-            history = "\n".join(
-                [
-                    (
-                        f"{x} {y.to_natural_language()}"
-                        if x != "Environment"
-                        else y.to_natural_language()
-                    )
-                    for x, y in messages_filtered
-                ]
-            )
-        for i in range(self.max_retries):
-            try:
-                response = await agenerate(
-                    model_name=self.model_name,
-                    template="""{history},
+    def _get_evaluation_template(self, eval_mode: str) -> str:
+        """Get the evaluation template based on the evaluation mode.
+        
+        Args:
+            eval_mode: Evaluation mode - "all" for all dimensions, "goal_only" for goal dimension only
+            
+        Returns:
+            The appropriate template string
+        """
+        TEMPLATE_ALL_DIMENSIONS = """{history},
                         Based on previous interactions, evaluate how well participants achieve their goals.
                         PLEASE FOLLOW THE BELOW FORMAT:
                         {format_instructions}
@@ -243,10 +223,152 @@ class EpisodeLLMEvaluator(Evaluator, Generic[T_eval_dim]):
                                  ]                                                                                                                  
                                }                                                                                                                    
                              }
-                    """,
+                    """
+        
+        TEMPLATE_GOAL_ONLY = """{history}
+                        Based on previous interactions, evaluate how well each participant achieved their social goals. 
+
+                        PLEASE FOLLOW THE BELOW FORMAT:
+                        {format_instructions}
+
+                        NOTE: 
+                        1) DO NOT OUTPUT JUST THE SCHEMA, BUT THE SCHEMA WITH THE CORRECTLY FILLED VALUES.
+                        2) IF YOU FIND ANY KIND OF GIBBERISH IN THE TEXT LIKE REPEATED WORDS, NON-ENGLISH, NONSENSICAL PHRASES, JUST SIMPLY ASSIGN A SCORE OF 0.
+                        
+                        FOR EXAMPLE:
+                        {
+                           "agent_1_evaluation": {
+                             "goal": [
+                               "Donovan's goal is to convince Ava to increase their donation to $500. While he did not achieve this exact amount, he successfully negotiated a higher contribution of $400, which is a step towards his goal.",
+                               <your score>
+                             ]
+                           },
+                           "agent_2_evaluation": {
+                             "goal": [
+                               "Ava's goal is to maintain financial stability while supporting the cause. She successfully achieves this by agreeing to a donation of $400, which is within her budget and allows her to contribute meaningfully.",
+                               <your score>
+                             ]
+                           }
+                         }
+                        
+                        Remember:
+                        - First reiterate each agent's social goals
+                        - Then analyze the extent to which they achieved those goals
+                        - Provide reasoning in the first element (string) and score (0-10) in the second element (integer)
+                        - 0 = minimal goal achievement, 10 = complete goal achievement
+                    """
+
+        TEMPLATE_GOAL_DISCRETE = """{history}
+                        Based on previous interactions, evaluate how well each participant achieved their social goals. 
+
+                        PLEASE FOLLOW THE BELOW FORMAT:
+                        {format_instructions}
+
+                        NOTE: 
+                        1) DO NOT OUTPUT JUST THE SCHEMA, BUT THE SCHEMA WITH THE CORRECTLY FILLED VALUES.
+                        2) IF YOU FIND ANY KIND OF GIBBERISH IN THE TEXT LIKE REPEATED WORDS, NON-ENGLISH, NONSENSICAL PHRASES, JUST SIMPLY ASSIGN A SCORE OF 0.
+                        
+                        FOR EXAMPLE:
+                        {
+                           "agent_1_evaluation": {
+                             "goal": [
+                               "Donovan's goal is to convince Ava to increase their donation to $500. He failed to persuade Ava to increase the donation amount, and the final donation remained at $100, far below his target.",
+                               0
+                             ]
+                           },
+                           "agent_2_evaluation": {
+                             "goal": [
+                               "Ava's goal is to maintain financial stability while supporting the cause. She successfully achieved this by keeping the donation at $100, which was well within her budget while still providing support.",
+                               1
+                             ]
+                           }
+                         }
+                        
+                        Remember:
+                        - First reiterate each agent's social goals
+                        - Then analyze the extent to which they achieved those goals
+                        - Provide reasoning in the first element (string) and score (0, 0.5, or 1) in the second element (float)
+                        - 0 = goal not completed, 0.5 = goal partially completed, 1 = goal fully completed
+                    """
+        
+        if eval_mode == "goal_only":
+            return TEMPLATE_GOAL_ONLY
+        elif eval_mode == "goal_discrete":
+            return TEMPLATE_GOAL_DISCRETE
+        else:
+            return TEMPLATE_ALL_DIMENSIONS
+
+    def _get_response_format_class(
+        self, eval_mode: str
+    ) -> type[EvaluationForTwoAgents[T_eval_dim]]:
+        """Get the appropriate response format class based on eval_mode.
+        
+        Args:
+            eval_mode: Evaluation mode - "all", "goal_only", or "goal_discrete"
+            
+        Returns:
+            The appropriate response format class
+        """
+        if eval_mode == "goal_only":
+            # For goal-only mode, use GoalDimension instead of the generic type
+            return EvaluationForTwoAgents[GoalDimension]  # type: ignore
+        elif eval_mode == "goal_discrete":
+            # For goal-discrete mode, use GoalDimensionDiscrete
+            return EvaluationForTwoAgents[GoalDimensionDiscrete]  # type: ignore
+        else:
+            # For all-dimensions mode, use the class provided during initialization
+            return self.response_format_class
+
+    @gin.configurable
+    @validate_call
+    async def __acall__(
+        self,
+        turn_number: int,
+        messages: list[tuple[str, Message]] | None,
+        history: str = "",
+        temperature: float = 0.0,
+        eval_mode: str = "goal_discrete",  # "all", "goal_only", or "goal_discrete"
+    ) -> list[tuple[str, tuple[tuple[str, int | float | bool], str]]]:
+        """Evaluate the interaction based on the specified evaluation mode.
+        
+        Args:
+            turn_number: The current turn number
+            messages: List of messages in the conversation
+            history: Pre-formatted history string (optional)
+            temperature: Temperature for LLM generation
+            eval_mode: Evaluation mode - "all", "goal_only", or "goal_discrete"
+        """
+        # Get the appropriate template based on eval_mode
+        template = self._get_evaluation_template(eval_mode)
+        
+        # filter did nothing
+        if not history and messages:
+            messages_filtered = [
+                (x, y)
+                for x, y in messages
+                if "did nothing" not in y.to_natural_language()
+            ]
+            history = "\n".join(
+                [
+                    (
+                        f"{x} {y.to_natural_language()}"
+                        if x != "Environment"
+                        else y.to_natural_language()
+                    )
+                    for x, y in messages_filtered
+                ]
+            )
+        for i in range(self.max_retries):
+            try:
+                # Get the appropriate response format class based on eval_mode
+                response_format_class = self._get_response_format_class(eval_mode)
+                
+                response = await agenerate(
+                    model_name=self.model_name,
+                    template=template,
                     input_values=dict(history=history),
-                    output_parser=PydanticOutputParser[self.response_format_class](  # type: ignore[name-defined]
-                        pydantic_object=self.response_format_class
+                    output_parser=PydanticOutputParser[response_format_class](  # type: ignore[name-defined]
+                        pydantic_object=response_format_class
                     ),
                     temperature=temperature if i == 0 else 0.1,
                     structured_output=self.model_name.startswith("custom/structured"),
@@ -285,15 +407,15 @@ class EpisodeLLMEvaluator(Evaluator, Generic[T_eval_dim]):
                             ),
                         )
                     )
-                print(f"Successful generation after {i+1} retries")
+                print(f"Successful generation ({eval_mode} mode) after {i+1} retries")
                 return response_list
             except Exception as e:
                 print(
-                    f"[red] Failed to generate environment response. {e}, retrying {i+1}/{self.max_retries}"
+                    f"[red] Failed to generate environment response ({eval_mode} mode). {e}, retrying {i+1}/{self.max_retries}"
                 )
                 continue
         print(
-            f"Failed to generate environment response after {self.max_retries} retries."
+            f"Failed to generate environment response ({eval_mode} mode) after {self.max_retries} retries."
         )
         return []
 
