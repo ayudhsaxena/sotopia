@@ -5,7 +5,10 @@ from litellm.utils import supports_response_schema
 from litellm.litellm_core_utils.get_supported_openai_params import (
     get_supported_openai_params,
 )
-from typing import cast
+from typing import cast, Any
+import httpx
+from openai import AsyncOpenAI
+from functools import lru_cache
 
 import gin
 
@@ -236,14 +239,183 @@ async def agenerate(
 
     return parsed_result, result
 
+# Cache AsyncOpenAI clients keyed by connection config and target endpoint
+_OPENAI_CLIENT_CACHE = {}
+
+def _get_openai_client(
+    *,
+    base_url: str | None,
+    api_key: str | None,
+    max_connections: int,
+    max_keepalive_connections: int,
+    timeout: float,
+    max_retries: int,
+) -> AsyncOpenAI:
+    """
+    Return a cached AsyncOpenAI client matching the provided configuration.
+    """
+    cache_key = (
+        base_url,
+        api_key,
+        max_connections,
+        max_keepalive_connections,
+        timeout,
+        max_retries,
+    )
+    client = _OPENAI_CLIENT_CACHE.get(cache_key)
+    if client is None:
+        client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            max_retries=max_retries,
+            http_client=httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_keepalive_connections,
+                ),
+                timeout=timeout,
+            ),
+        )
+        _OPENAI_CLIENT_CACHE[cache_key] = client
+    return client
+
+@gin.configurable
+@validate_call
+async def agenerate_openai(
+    model_name: str,
+    template: str,
+    input_values: dict[str, str],
+    output_parser: OutputParser[OutputType],
+    temperature: float = 0.7,
+    structured_output: bool = False,
+    bad_output_process_model: str | None = None,
+    use_fixed_model_version: bool = True,
+    mental_state_generation: MentalStateGeneration = MentalStateGeneration.NO_MENTAL_STATE,
+    client: Any | None = None,
+    openai_max_connections: int = 1024,
+    openai_max_keepalive_connections: int = 256,
+    openai_timeout: float = 60.0,
+    openai_max_retries: int = 2,
+) -> OutputType | tuple[AgentAction | OutputType, str]:
+    """Generate text using OpenAI's AsyncOpenAI client with a high-concurrency HTTP client."""
+    response_parser = get_response_parser(mental_state_generation)
+
+    # Ensure format instructions are present
+    if "format_instructions" not in input_values:
+        input_values["format_instructions"] = output_parser.get_format_instructions()
+
+    # Process template docstring and replace variables
+    template = format_docstring(template)
+    for key, value in input_values.items():
+        template = template.replace(f"{{{key}}}", str(value))
+
+    original_model_name = model_name
+
+    # Resolve base_url/api_key and a pure model name suitable for the OpenAI client
+    base_url: str | None
+    api_key: str | None
+    if model_name.startswith("custom"):
+        base_url, api_key = (
+            model_name.split("@")[1],
+            os.environ.get("CUSTOM_API_KEY", "EMPTY"),
+        )
+        provider_and_model = model_name.split("@")[0]
+        # Drop provider prefix (e.g., "custom/" or "openai/")
+        model_core = provider_and_model.split("/", 1)[1] if "/" in provider_and_model else provider_and_model
+    elif model_name.startswith("openai/"):
+        base_url, api_key = (None, None)
+        model_core = model_name.split("/", 1)[1]
+    else:
+        base_url, api_key = (None, None)
+        model_core = model_name
+
+    # Build messages
+    if mental_state_generation != MentalStateGeneration.NO_MENTAL_STATE:
+        messages = [
+            {"role": "system", "content": get_system_prompt(mental_state_generation)},
+            {"role": "user", "content": template},
+        ]
+    else:
+        messages = [{"role": "user", "content": template}]
+
+    # Get or create a high-concurrency AsyncOpenAI client (cached)
+    if client is None:
+        client = _get_openai_client(
+            base_url=base_url,
+            api_key=api_key,
+            max_connections=openai_max_connections,
+            max_keepalive_connections=openai_max_keepalive_connections,
+            timeout=openai_timeout,
+            max_retries=openai_max_retries,
+        )
+
+    # Structured output (best-effort support for JSON schema with OpenAI)
+    if structured_output:
+        assert isinstance(
+            output_parser, PydanticOutputParser
+        ), "structured output only supported in PydanticOutputParser"
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": output_parser.pydantic_object.__name__,
+                "schema": output_parser.pydantic_object.model_json_schema(),  # type: ignore[attr-defined]
+                "strict": True,
+            },
+        }
+        response = await client.chat.completions.create(
+            model=model_core,
+            messages=messages,
+            temperature=temperature,
+            response_format=response_format,  # OpenAI JSON schema mode
+        )
+        result = response.choices[0].message.content
+        assert isinstance(result, str)
+        return cast(OutputType, output_parser.parse(result))
+
+    # Regular generation
+    response = await client.chat.completions.create(
+        model=model_core,
+        messages=messages,
+        temperature=temperature,
+    )
+
+    # Handle mental state parsing flow or default parsing
+    if mental_state_generation != MentalStateGeneration.NO_MENTAL_STATE:
+        return perform_output_parsing(response, output_parser, response_parser=response_parser)
+    else:
+        result = response.choices[0].message.content
+        try:
+            assert isinstance(result, str)
+            parsed_result = output_parser.parse(result)
+        except Exception as e:
+            if isinstance(output_parser, ScriptOutputParser):
+                raise e
+            log.debug(
+                f"[red] Failed to parse result: {result}\nEncounter Exception {e}\nstart to reparse",
+                extra={"markup": True},
+            )
+            reformat_result = await format_bad_output(
+                result or "",
+                output_parser.get_format_instructions(),
+                bad_output_process_model or original_model_name,
+                use_fixed_model_version,
+            )
+            parsed_result = output_parser.parse(reformat_result)
+        return parsed_result, result  # type: ignore[return-value]
+
 def perform_output_parsing(response, output_parser, response_parser: XMLParser) -> tuple[AgentAction | OutputType, str]:
     result = response.choices[0].message.content
 
     # Check if the response has reasoning_content (API-parsed thinking)
     think = None
-    if hasattr(response.choices[0].message, 'reasoning_content') :
+    if hasattr(response.choices[0].message, 'reasoning_content'):
         think = response.choices[0].message.reasoning_content
-        result = f"<think>{think}</think>{result}"
+        # Only prepend reasoning content if it is a non-empty string and
+        # the result does not already contain a <think> tag.
+        if isinstance(think, str):
+            stripped_think = think.strip()
+            if stripped_think and stripped_think.lower() != "none" and "<think>" not in (result or ""):
+                result = f"<think>{stripped_think}</think>{result}"
 
 
     # If no reasoning_content, try to parse from result
@@ -367,7 +539,7 @@ async def agenerate_action(
             template = get_action_template(MentalStateGeneration.NO_MENTAL_STATE)
         else:
             template = get_action_template(mental_state_generation)
-        return await agenerate(
+        return await agenerate_openai(
             model_name=model_name,
             template=template,
             input_values=dict(

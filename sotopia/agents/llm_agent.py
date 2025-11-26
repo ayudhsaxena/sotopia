@@ -1,6 +1,7 @@
 import asyncio
+import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import cast
+from typing import Any, cast
 
 from sotopia.agents import BaseAgent
 from sotopia.database import AgentProfile
@@ -16,6 +17,8 @@ from sotopia.utils import format_docstring
 
 from sotopia.generation_utils.output_parsers import  PydanticOutputParser
 from sotopia.generation_utils.enums import MentalStateGeneration
+
+logger = logging.getLogger(__name__)
 
 async def ainput(prompt: str = "") -> str:
     with ThreadPoolExecutor(1, "ainput") as executor:
@@ -65,6 +68,41 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
     ) -> AgentAction:
         raise Exception("Sync act method is deprecated. Use aact instead.")
 
+    def _normalize_action_result(self, result: Any) -> tuple[AgentAction, str]:
+        """Ensure downstream code receives a (AgentAction, raw_str) tuple."""
+        if isinstance(result, AgentAction):
+            return result, ''
+
+        if isinstance(result, tuple):
+            action, raw = result
+
+            # Flatten potential nested tuple e.g., ((AgentAction, str), str)
+            if isinstance(action, tuple) and action:
+                action = action[0]
+
+            if not isinstance(action, AgentAction):
+                logger.info("Received non-AgentAction inside LLMAgent: %s", action)
+                try:
+                    if isinstance(action, dict):
+                        action = AgentAction.parse_obj(action)
+                    elif isinstance(action, str):
+                        parser = PydanticOutputParser(pydantic_object=AgentAction)
+                        parsed = parser.parse(action)
+                        action = (
+                            parsed
+                            if isinstance(parsed, AgentAction)
+                            else AgentAction(action_type="speak", argument=action)
+                        )
+                    else:
+                        action = AgentAction(action_type="speak", argument=str(action))
+                except Exception:
+                    action = AgentAction(action_type="speak", argument=str(action))
+
+            raw_str = raw if isinstance(raw, str) else str(raw)
+            return action, raw_str
+
+        return AgentAction(action_type="speak", argument=str(result)), ''
+
     async def aact(self, obs: Observation) -> AgentAction | tuple[AgentAction, str]:
         self.recv_message("Environment", obs)
         if self._goal is None:
@@ -79,7 +117,7 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
             return AgentAction(action_type="none", argument=""), ''
         else:
             # print(f"{self.agent_name}: {self.get_interaction_history(obs.turn_number)}")
-            return await agenerate_action(
+            result = await agenerate_action(
                 self.model_name,
                 history=self.get_interaction_history(obs.turn_number),
                 turn_number=obs.turn_number,
@@ -89,6 +127,7 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
                 script_like=self.script_like,
                 mental_state_generation=self.mental_state_generation,
             )
+            return self._normalize_action_result(result)
 
     def get_interaction_history(self, turn_number: int) -> str:
         history = []

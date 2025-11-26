@@ -26,6 +26,11 @@ def zero_to_one_discrete(v: float) -> float:
         raise ValueError("The value should be 0, 0.5, or 1")
     return v
 
+def zero_or_one(v: int) -> int:
+    if v not in [0, 1]:
+        raise ValueError("The value should be 0 or 1")
+    return v
+
 
 class SotopiaDimensionsPlus(BaseModel):
     """Updated SotopiaDimensions with more detailed instructions"""
@@ -178,6 +183,18 @@ class GoalDimensionDiscrete(BaseModel):
         description="Please first reiterate agent's social goals. "
         "And then please provide a comprehensive analysis about the extent to which the agent has managed to achieve these goals. "
         "The first entry (str) of the object is the 'reasoning' field, and the second entry (float) of the object is the 'score' field. In the 'reasoning' field, provide a comprehensive account of the logic or thought process that led you to your conclusion. Further, provide a score of 0, 0.5, or 1 in the 'score' field. 0 represents goal not completed, 0.5 represents goal partially completed, and 1 represents goal fully completed.",
+    )
+
+class GoalDimensionBinary(BaseModel):
+    """Goal only evaluation with binary scores (0 or 1)"""
+
+    goal: Annotated[
+        tuple[str, int], AfterValidator(lambda x: (x[0], zero_or_one(x[1])))
+    ] = Field(
+        ...,
+        description="Please first reiterate agent's social goals. "
+        "And then please provide a comprehensive analysis about the extent to which the agent has managed to achieve these goals. "
+        "The first entry (str) of the object is the 'reasoning' field, and the second entry (int) of the object is the 'score' field. In the 'reasoning' field, provide a comprehensive account of the logic or thought process that led you to your conclusion. Further, provide a score of 0 or 1 in the 'score' field. 0 represents goal not completed, and 1 represents goal fully completed.",
     )
 
 

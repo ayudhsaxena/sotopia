@@ -580,7 +580,9 @@ class ParallelSotopiaEnv(ParallelEnv[str, Observation, AgentAction], MessengerMi
             if isinstance(action, AgentAction):
                 complied_actions[key] = action
             else:
-                print(f"Received non-AgentAction: {action}")
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(f"Received non-AgentAction: {action}")
                 action["action_type"] = self.available_action_types[
                     int(action["action_type"])
                 ]
